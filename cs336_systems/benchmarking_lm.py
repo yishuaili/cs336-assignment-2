@@ -18,7 +18,10 @@ from cs336_basics.optimizer import AdamW
 #     --d_model 768 \
 #     --d_ff 3072 \
 #     --num_layers 12 \
-#     --num_heads 12
+#     --num_heads 12 \
+#     --warmup_iters 5 \
+#     --num_runs 5 \
+#     --benchmarking_iters 10
 
 
 # parsing the benchmarking configuration
@@ -30,7 +33,8 @@ class BenchMarkingConfig:
     num_heads: int
     d_ff: int
     # optional arguments
-    benchmarking_iters: Optional[int] = field(default=5)
+    num_runs: Optional[int] = field(default=5)
+    benchmarking_iters: Optional[int] = field(default=10)
     warmup_iters: Optional[int] = field(default=1)
     wandb_run_name: Optional[str] = field(default='None')
     mixed_precision: Optional[bool] = field(default=False)
@@ -73,7 +77,7 @@ logging.info(f'Benchmarking with config: {asdict(config)}')
 x = torch.randint(0, config.vocab_size, (config.batch_size, config.context_length))
 x = x.to(config.device)
 y = torch.randint(0, config.vocab_size, (config.batch_size, config.context_length))
-y = y.to(config.device)
+y = y.to(config.device) 
 
 # initializing a rando model
 # Define the specific keys the model architecture needs
@@ -91,7 +95,9 @@ model_args = {
 model = BasicsTransformerLM(**model_args)
 #model = BasicsTransformerLM(**asdict(config))
 model = model.to(config.device)
-# model = torch.compile(model)
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+model = torch.compile(model)
 
 # loading the optimizer
 optimizer = AdamW(model.parameters())
@@ -126,8 +132,6 @@ def timer(run: Callable):
 
 iter_num = 0
 # warm up
-forward_times = np.zeros(config.benchmarking_iters)
-backward_times = np.zeros(config.benchmarking_iters)
 for _ in range(config.warmup_iters):
     with train_context:
         loss = forward_pass()
@@ -135,14 +139,28 @@ for _ in range(config.warmup_iters):
         clip_gradient(model.parameters(), 1.0)
         optimizer.step()
 
-for i in range(config.benchmarking_iters):
-    with train_context:
-        forward_times[i], loss = timer(forward_pass)
-        backward_times[i], _ = timer(backward_pass)
-        clip_gradient(model.parameters(), 1.0)
-        optimizer.step()
+all_forward_times = []
+all_backward_times = []
+
+for run in range(config.num_runs):
+    forward_times = np.zeros(config.benchmarking_iters)
+    backward_times = np.zeros(config.benchmarking_iters)
+    for i in range(config.benchmarking_iters):
+        with train_context:
+            forward_times[i], loss = timer(forward_pass)
+            backward_times[i], _ = timer(backward_pass)
+            clip_gradient(model.parameters(), 1.0)
+            optimizer.step()
+    
+    # Store this run's timings
+    all_forward_times.extend(forward_times)
+    all_backward_times.extend(backward_times)
+    
+    # Print per-run stats
+    print(f'Run {run + 1}/{config.num_runs} - Forward pass: {np.mean(forward_times):.5f}s +- {np.std(forward_times):.5f}s, Backward pass: {np.mean(backward_times):.5f}s +- {np.std(backward_times):.5f}s')
 
 
-# benchmarking
-print(f'Forward pass time: {np.mean(forward_times)}, std: {np.std(forward_times)}')
-print(f'Backward pass time: {np.mean(backward_times)}, std: {np.std(backward_times)}')
+# benchmarking over all runs
+print(f'\n--- Overall Benchmarking ({config.num_runs} runs of {config.benchmarking_iters} steps) ---')
+print(f'Forward pass time: {np.mean(all_forward_times):.5f}, std: {np.std(all_forward_times):.5f}')
+print(f'Backward pass time: {np.mean(all_backward_times):.5f}, std: {np.std(all_backward_times):.5f}')
