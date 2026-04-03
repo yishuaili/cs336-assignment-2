@@ -8,9 +8,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 import numpy as np
 import time
 
-from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.nn_utils import cross_entropy, clip_gradient, softmax
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
+import cs336_basics.model
+
+import torch.cuda.nvtx as nvtx
+import math
+from einops import einsum
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
+    with nvtx.range("final matmul"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 # Example command to run the script:
 # uv run python cs336_systems/benchmarking_lm.py \
@@ -22,6 +41,9 @@ from cs336_basics.optimizer import AdamW
 #     --warmup_iters 5 \
 #     --num_runs 5 \
 #     --benchmarking_iters 10
+
+# Example to run nsys profiler
+# uv run nsys profile -o result_small_ctx_128_3 --trace=cuda,nvtx python cs336_systems/benchmarking_lm.py --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --context_length 128 --warmup_iters 5 --num_runs 1 --benchmarking_iters 1
 
 
 # parsing the benchmarking configuration
@@ -110,8 +132,9 @@ else:
 def forward_pass():
     #torch.cuda.synchronize()
     synchronize()
-    logits = model(x)
-    loss = cross_entropy(logits, y)
+    with nvtx.range("forward pass"):
+        logits = model(x)
+        loss = cross_entropy(logits, y)
     #torch.cuda.synchronize()
     synchronize()
     return loss
@@ -119,8 +142,9 @@ def forward_pass():
 def backward_pass():
     #torch.cuda.synchronize()
     synchronize()
-    optimizer.zero_grad()
-    loss.backward()
+    with nvtx.range("backward pass"):
+        optimizer.zero_grad()
+        loss.backward()
     #torch.cuda.synchronize()
     synchronize()
 
@@ -132,12 +156,14 @@ def timer(run: Callable):
 
 iter_num = 0
 # warm up
-for _ in range(config.warmup_iters):
-    with train_context:
-        loss = forward_pass()
-        backward_pass()
-        clip_gradient(model.parameters(), 1.0)
-        optimizer.step()
+with nvtx.range("warmup"):
+    for _ in range(config.warmup_iters):
+        with train_context:
+            loss = forward_pass()
+            backward_pass()
+            clip_gradient(model.parameters(), 1.0)
+            with nvtx.range("optimizer step"):
+                optimizer.step()
 
 all_forward_times = []
 all_backward_times = []
@@ -150,7 +176,8 @@ for run in range(config.num_runs):
             forward_times[i], loss = timer(forward_pass)
             backward_times[i], _ = timer(backward_pass)
             clip_gradient(model.parameters(), 1.0)
-            optimizer.step()
+            with nvtx.range("optimizer step"):
+                optimizer.step()
     
     # Store this run's timings
     all_forward_times.extend(forward_times)
