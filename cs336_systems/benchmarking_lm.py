@@ -43,7 +43,7 @@ cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_a
 #     --benchmarking_iters 10
 
 # Example to run nsys profiler
-# uv run nsys profile -o result_small_ctx_128_3 --trace=cuda,nvtx python cs336_systems/benchmarking_lm.py --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --context_length 128 --warmup_iters 5 --num_runs 1 --benchmarking_iters 1
+# uv run nsys profile -o result_small_ctx_128_3 --trace=cuda,nvtx python cs336_systems/benchmarking_lm.py --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --context_length 128 --warmup_iters 5 --num_runs 1 --benchmarking_iters 1 > output_small_ctx_128.log 2>&1
 
 
 # parsing the benchmarking configuration
@@ -66,7 +66,7 @@ class BenchMarkingConfig:
     # fixed configs
     wandb_project: str = 'cs336-assignment2-systems'
     context_length: int = 128
-    batch_size: int = 16
+    batch_size: int = 12
     vocab_size: int = 10000
 
     def __post_init__(self):
@@ -119,7 +119,7 @@ model = BasicsTransformerLM(**model_args)
 model = model.to(config.device)
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
-model = torch.compile(model)
+# model = torch.compile(model)
 
 # loading the optimizer
 optimizer = AdamW(model.parameters())
@@ -130,23 +130,19 @@ else:
     train_context = nullcontext()
 
 def forward_pass():
-    #torch.cuda.synchronize()
     synchronize()
     with nvtx.range("forward pass"):
         logits = model(x)
         loss = cross_entropy(logits, y)
-    #torch.cuda.synchronize()
-    synchronize()
+        synchronize()
     return loss
 
 def backward_pass():
-    #torch.cuda.synchronize()
     synchronize()
     with nvtx.range("backward pass"):
         optimizer.zero_grad()
         loss.backward()
-    #torch.cuda.synchronize()
-    synchronize()
+        synchronize()
 
 def timer(run: Callable):
     t1 = time.time()
