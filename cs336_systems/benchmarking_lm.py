@@ -62,6 +62,7 @@ class BenchMarkingConfig:
     mixed_precision: Optional[bool] = field(default=False)
     # use_rms_norm: Optional[bool] = field(default=True)
     rope_theta: Optional[float] = field(default=10000)
+    inference_only: Optional[bool] = field(default=False)
 
     # fixed configs
     wandb_project: str = 'cs336-assignment2-systems'
@@ -123,7 +124,7 @@ torch._dynamo.config.suppress_errors = True
 
 # loading the optimizer
 optimizer = AdamW(model.parameters())
-# initialize the training context
+# initialize the training context (will be overridden if inference_only)
 if config.mixed_precision:
     train_context = torch.amp.autocast(device_type=config.device, dtype=torch.bfloat16)
 else:
@@ -151,15 +152,25 @@ def timer(run: Callable):
     return t2-t1, result
 
 iter_num = 0
+
+if config.inference_only:
+    train_context = torch.no_grad()
+else:
+    if config.mixed_precision:
+        train_context = torch.amp.autocast(device_type=config.device, dtype=torch.bfloat16)
+    else:
+        train_context = nullcontext()
+
 # warm up
 with nvtx.range("warmup"):
     for _ in range(config.warmup_iters):
         with train_context:
             loss = forward_pass()
-            backward_pass()
-            clip_gradient(model.parameters(), 1.0)
-            with nvtx.range("optimizer step"):
-                optimizer.step()
+            if not config.inference_only:
+                backward_pass()
+                clip_gradient(model.parameters(), 1.0)
+                with nvtx.range("optimizer step"):
+                    optimizer.step()
 
 all_forward_times = []
 all_backward_times = []
@@ -170,14 +181,16 @@ for run in range(config.num_runs):
     for i in range(config.benchmarking_iters):
         with train_context:
             forward_times[i], loss = timer(forward_pass)
-            backward_times[i], _ = timer(backward_pass)
-            clip_gradient(model.parameters(), 1.0)
-            with nvtx.range("optimizer step"):
-                optimizer.step()
+            if not config.inference_only:
+                backward_times[i], _ = timer(backward_pass)
+                clip_gradient(model.parameters(), 1.0)
+                with nvtx.range("optimizer step"):
+                    optimizer.step()
     
     # Store this run's timings
     all_forward_times.extend(forward_times)
-    all_backward_times.extend(backward_times)
+    if not config.inference_only:
+        all_backward_times.extend(backward_times)
     
     # Print per-run stats
     print(f'Run {run + 1}/{config.num_runs} - Forward pass: {np.mean(forward_times):.5f}s +- {np.std(forward_times):.5f}s, Backward pass: {np.mean(backward_times):.5f}s +- {np.std(backward_times):.5f}s')
